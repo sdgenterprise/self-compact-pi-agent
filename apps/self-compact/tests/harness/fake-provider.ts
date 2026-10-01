@@ -211,17 +211,33 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 		stopReason: "pending",
 		timestamp: Date.now(),
 	};
-	const isSummary = !context.tools || context.tools.length === 0;
+	// pi >=0.99 hands streamSimple a TranscriptContext ({ messages } only): tools and the system
+	// prompt moved onto the leading system message. On older pis the Context still carries tools.
+	// Either way a compaction request is recognized by its payload: the last user message is the
+	// serialized history ("<conversation>…" for history summaries, "# Conversation…# Instructions"
+	// for split-turn prefixes), which no normal turn ever produces.
+	const lastForKind = context.messages[context.messages.length - 1];
+	const lastForKindText = lastForKind ? textOf((lastForKind as { content?: unknown }).content) : "";
+	const isSummary =
+		"tools" in context
+			? !(context as { tools?: unknown[] }).tools || (context as { tools?: unknown[] }).tools!.length === 0
+			: lastForKind?.role === "user" &&
+				(/^\s*<conversation>/.test(lastForKindText) || /^# Conversation\n[\s\S]*\n\n# Instructions\n/.test(lastForKindText));
+	// The system prompt (base prompt on turns, compaction prompt on summaries) is the leading system message.
+	const systemText = (() => {
+		const sys = context.messages.find((m) => m.role === "system");
+		return sys ? textOf((sys as { content?: unknown }).content) : "";
+	})();
 	setTimeout(() => {
 		try {
 			stream.push({ type: "start", partial: output });
 			if (isSummary) {
 				summaryCalls += 1;
-				trace({ kind: "summary", call: summaryCalls, systemPrompt: context.systemPrompt?.slice(0, 200) });
+				trace({ kind: "summary", call: summaryCalls, systemPrompt: systemText.slice(0, 200) });
 				if (summaryCalls <= SUMMARY_FAIL) {
 					throw new Error(`fake summary failure #${summaryCalls}`);
 				}
-				const text = `FAKE-SUMMARY[${(context.systemPrompt ?? "").slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
+				const text = `FAKE-SUMMARY[${systemText.slice(0, 60)}]\n## Goal\nScripted goal.\n## Next Steps\n1. Follow the note.`;
 				output.content.push({ type: "text", text: "" });
 				stream.push({ type: "text_start", contentIndex: 0, partial: output });
 				(output.content[0] as { text: string }).text = text;
@@ -244,7 +260,7 @@ function streamScripted(model: Model<any>, context: Context, options?: SimpleStr
 					stream.push({ type: "text_end", contentIndex: index, content: plan.text, partial: output });
 					index += 1;
 				}
-				const emitCall = (name: string, args: Record<string, unknown>) => {
+				const emitCall = (name: string, args: Record<string, any>) => {
 					const id = `call_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 					const toolCall = { type: "toolCall" as const, id, name, arguments: args };
 					output.content.push(toolCall);

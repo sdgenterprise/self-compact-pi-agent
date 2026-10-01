@@ -186,15 +186,18 @@ test('P2: native engine preserves split turns, previous summaries, budgets and f
   assert.ok(result.compaction);
   assert.equal(h.requests.length, 2);
   assert.deepEqual(h.requests.map(({ options }) => options.maxTokens), [800, 500]);
+  // pi >=0.99 normalizes the summarization context before the stream override runs, so a
+  // system message leads; the summary payload is the user message, wherever it sits.
+  const userText = request => request.messages.find(m => m.role === 'user').content[0].text;
   for (const { request, options } of h.requests) {
     assert.equal(request.systemPrompt, 'EXACT SYSTEM OVERRIDE');
     assert.equal(options.reasoningEffort, 'low');
-    assert.match(request.messages[0].content[0].text, /USER INSTRUCTIONS.*preserve evidence/);
-    assert.match(request.messages[0].content[0].text, /Keep the failing test name/);
-    assert.doesNotMatch(request.messages[0].content[0].text, /Use this EXACT format/);
+    assert.match(userText(request), /USER INSTRUCTIONS.*preserve evidence/);
+    assert.match(userText(request), /Keep the failing test name/);
+    assert.doesNotMatch(userText(request), /Use this EXACT format/);
   }
-  assert.match(h.requests[0].request.messages[0].content[0].text, /<previous-summary>\nPrevious checkpoint/);
-  assert.match(h.requests[1].request.messages[0].content[0].text, /Continue parser tests/);
+  assert.match(userText(h.requests[0].request), /<previous-summary>\nPrevious checkpoint/);
+  assert.match(userText(h.requests[1].request), /Continue parser tests/);
   assert.match(result.compaction.summary, /Turn Context \(split turn\)/);
   assert.deepEqual(result.compaction.details.readFiles, ['README.md']);
   assert.deepEqual(result.compaction.details.modifiedFiles, ['parser.ts']);

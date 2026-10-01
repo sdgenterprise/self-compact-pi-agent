@@ -1,9 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
 	compact,
-	convertToLlm,
 	findCutPoint,
-	serializeConversation,
 	sessionEntryToContextMessages,
 	SettingsManager,
 	type CompactionEntry,
@@ -52,11 +50,6 @@ export function keepRecentTokens(cwd: string): number {
 	return SettingsManager.create(cwd).getCompactionKeepRecentTokens();
 }
 
-function historyInput(messages: SessionBeforeCompactEvent["preparation"]["messagesToSummarize"], previous?: string): string {
-	const conversation = serializeConversation(convertToLlm(messages));
-	return `<conversation>\n${conversation}\n</conversation>\n\n${previous ? `<previous-summary>\n${previous}\n</previous-summary>\n\n` : ""}`;
-}
-
 function summaryInstructions(event: SessionBeforeCompactEvent, prompt: LoadedPrompt): string {
 	return [
 		"Summarize the supplied historical data. Do not continue the task, simulate tools, or claim actions without tool-result evidence. Keep pending actions pending.",
@@ -66,8 +59,14 @@ function summaryInstructions(event: SessionBeforeCompactEvent, prompt: LoadedPro
 	].filter(Boolean).join("\n\n");
 }
 
-/** Match complete known inputs, so tag-like text inside history cannot cut the conversation short. */
-function replaceInstructions(context: Context, inputs: string[], instructions: string, budgetChars: number) {
+/**
+ * Keep Pi's serialized history and replace its instruction tail with ours. Pi's summarization
+ * requests come in two wrappers (the exact base prompts change between Pi versions, so parse the
+ * wrapper instead of reconstructing the input byte-for-byte):
+ *   history:     <conversation>\n…\n</conversation>\n\n[<previous-summary>\n…\n</previous-summary>\n\n]<pi base prompt>
+ *   turn prefix: # Conversation\n…\n\n# Instructions\n<pi base prompt>
+ */
+function replaceInstructions(context: Context, instructions: string, budgetChars: number) {
 	let truncated = false;
 	const messages = context.messages.map(message => {
 		if (message.role !== "user") return message;
@@ -76,13 +75,31 @@ function replaceInstructions(context: Context, inputs: string[], instructions: s
 			...message,
 			content: content.map(block => {
 				if (block.type !== "text") return block;
-				let input = inputs.find(candidate => block.text.startsWith(candidate));
-				if (input === undefined) throw new Error("Unrecognized Pi summary input; cannot replace instructions safely.");
-				if (input.length > budgetChars) {
-					input = `[earlier conversation truncated to fit summary budget]\n${input.slice(-budgetChars)}`;
+				const text = block.text;
+				let head: string;
+				if (text.startsWith("<conversation>\n")) {
+					let end = text.indexOf("\n</conversation>\n\n");
+					if (end < 0) throw new Error("Unrecognized Pi summary input; cannot replace instructions safely.");
+					end += "\n</conversation>\n\n".length;
+					if (text.slice(end).startsWith("<previous-summary>\n")) {
+						const prevEnd = text.indexOf("\n</previous-summary>\n\n", end);
+						if (prevEnd < 0) throw new Error("Unrecognized Pi summary input; cannot replace instructions safely.");
+						end = prevEnd + "\n</previous-summary>\n\n".length;
+					}
+					head = text.slice(0, end);
+				} else if (text.startsWith("# Conversation\n")) {
+					const marker = "\n\n# Instructions\n";
+					const idx = text.indexOf(marker);
+					if (idx < 0) throw new Error("Unrecognized Pi summary input; cannot replace instructions safely.");
+					head = text.slice(0, idx + marker.length);
+				} else {
+					throw new Error("Unrecognized Pi summary input; cannot replace instructions safely.");
+				}
+				if (head.length > budgetChars) {
+					head = `[earlier conversation truncated to fit summary budget]\n${head.slice(-budgetChars)}`;
 					truncated = true;
 				}
-				return { ...block, text: `${input}${instructions}` };
+				return { ...block, text: `${head}${instructions}` };
 			}),
 		};
 	});
@@ -92,7 +109,6 @@ function replaceInstructions(context: Context, inputs: string[], instructions: s
 /** Pi owns split turns, summary updates, file tracking and configured transport retries. */
 export async function generateSummary(event: SessionBeforeCompactEvent, ctx: ExtensionContext, system: LoadedPrompt, instructions: LoadedPrompt) {
 	if (!ctx.model) throw new Error("No model available for compaction.");
-	const inputs = [historyInput(event.preparation.messagesToSummarize, event.preparation.previousSummary), historyInput(event.preparation.turnPrefixMessages)].sort((a, b) => b.length - a.length);
 	const userInstructions = summaryInstructions(event, instructions);
 	let truncatedInput = false;
 	const result = await compact(
@@ -100,7 +116,7 @@ export async function generateSummary(event: SessionBeforeCompactEvent, ctx: Ext
 		async (model, context, options) => {
 			const maxTokens = Math.min(options?.maxTokens ?? 8192, model.maxTokens || 8192, 8192);
 			const budgetChars = Math.max(8000, (model.contextWindow - maxTokens - 2000) * 4 - system.text.length - userInstructions.length);
-			const { messages, truncated } = replaceInstructions(context, inputs, userInstructions, budgetChars);
+			const { messages, truncated } = replaceInstructions(context, userInstructions, budgetChars);
 			truncatedInput ||= truncated;
 			const response = await ctx.modelRegistry.complete(model, { ...context, systemPrompt: system.text, messages }, {
 				...options, maxTokens, signal: event.signal, cacheRetention: "none", sessionId: randomUUID(),
